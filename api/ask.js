@@ -1,113 +1,119 @@
 // api/ask.js
-// Vercel serverless function that calls your Gradio Space using @gradio/client
-// POST /api/ask  body: { "query": "text", "models": ["hf","openai"] }
+const axios = require('axios');
 
-const { Client } = require("@gradio/client");
-const axios = require("axios");
+const HF_SPACE_URL = process.env.HF_SPACE_URL || '';
+const HF_TOKEN = process.env.HF_TOKEN || '';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const DEFAULT_TIMEOUT = 25000;
 
-// Env vars
-const HF_SPACE = process.env.HF_SPACE || "exoticsuryaa/llm-by-surya"; // owner/space-name as in docs
-const HF_TOKEN = process.env.HF_TOKEN || ""; // leave blank for public spaces
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const DEFAULT_TIMEOUT = 30000;
-
-let gradioClient = null;
-let clientConnecting = null;
-
-async function getGradioClient() {
-  if (gradioClient) return gradioClient;
-  if (clientConnecting) return clientConnecting; // avoid race
-  clientConnecting = (async () => {
-    try {
-      if (HF_TOKEN) process.env.HF_TOKEN = HF_TOKEN; // @gradio/client reads HF_TOKEN env for private spaces
-      // Connect to the space (owner/space-name)
-      const c = await Client.connect(HF_SPACE);
-      gradioClient = c;
-      clientConnecting = null;
-      return gradioClient;
-    } catch (err) {
-      clientConnecting = null;
-      throw err;
-    }
-  })();
-  return clientConnecting;
+function safeBase(url) {
+  return url.replace(/\/+$/, '');
 }
 
-async function callHfChat(message) {
-  const client = await getGradioClient();
-  // API name shown in your screenshot is "/chat"; pass the required param object
-  // client.predict returns the same structure the UI uses. We normalize to string.
-  const res = await client.predict("/chat", { message });
-  // Typical return shapes vary. Normalize common cases:
-  if (res === null || typeof res === "undefined") return "";
-  if (typeof res === "string") return res;
-  // if result.data exists (some Gradio clients return { data: [...] })
-  if (res.data) {
-    if (Array.isArray(res.data) && res.data.length) return String(res.data[0]);
-    if (typeof res.data === "string") return res.data;
+async function tryPost(url, payload, headers = {}) {
+  try {
+    const r = await axios.post(url, payload, { headers, timeout: DEFAULT_TIMEOUT });
+    return { ok: true, url, status: r.status, data: r.data };
+  } catch (err) {
+    const resp = err.response;
+    return {
+      ok: false,
+      url,
+      status: resp ? resp.status : null,
+      error: resp ? JSON.stringify(resp.data) : (err.message || String(err))
+    };
   }
-  // fallback stringify
-  try { return JSON.stringify(res); } catch(e) { return String(res); }
+}
+
+/**
+ * Attempts common Gradio/Space HTTP endpoints and payload shapes.
+ * Returns normalized string on success, otherwise throws with attempts array.
+ */
+async function callHfSpace(query) {
+  if (!HF_SPACE_URL) throw new Error('HF_SPACE_URL not configured');
+
+  const base = safeBase(HF_SPACE_URL);
+  const endpoints = [
+    `${base}/run/predict`,
+    `${base}/api/predict`,
+    `${base}/predict`,
+    `${base}/run/predict/`,
+    `${base}/api/predict/`
+  ];
+
+  const payloadVariants = [
+    { data: [ query ] },
+    { data: [ query ], fn_index: 0 },
+    { input: query },
+    { inputs: query },
+    { message: query },
+    { text: query }
+  ];
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (HF_TOKEN) headers['Authorization'] = `Bearer ${HF_TOKEN}`;
+
+  const attempts = [];
+
+  for (const url of endpoints) {
+    for (const payload of payloadVariants) {
+      const attempt = await tryPost(url, payload, headers);
+      attempts.push(attempt);
+      if (attempt.ok && attempt.status >= 200 && attempt.status < 300) {
+        const d = attempt.data;
+        // common Gradio shape: { data: [ "<result>" ] }
+        if (d && Array.isArray(d.data) && d.data.length) return String(d.data[0]);
+        if (d && typeof d.data === 'string') return d.data;
+        if (typeof d === 'string') return d;
+        // fallback stringify the object
+        return JSON.stringify(d);
+      }
+    }
+  }
+
+  const summary = attempts.map(a =>
+    a.ok ? `${a.url} => ${a.status}` : `${a.url} => ERR ${a.error}`
+  );
+  const e = new Error('No working HF endpoint found. See attempts.');
+  e.attempts = attempts;
+  e.summary = summary;
+  throw e;
 }
 
 async function callOpenAI(query) {
-  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not configured");
-  const url = "https://api.openai.com/v1/chat/completions";
-  const body = {
-    model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-    messages: [{ role: "user", content: query }],
-    max_tokens: 512
-  };
-  const r = await axios.post(url, body, {
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-    timeout: DEFAULT_TIMEOUT
-  });
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not configured');
+  const url = 'https://api.openai.com/v1/chat/completions';
+  const body = { model: process.env.OPENAI_MODEL || 'gpt-4o-mini', messages:[{role:'user',content:query}], max_tokens:512 };
+  const r = await axios.post(url, body, { headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type':'application/json' }, timeout: DEFAULT_TIMEOUT });
   return r.data?.choices?.[0]?.message?.content ?? JSON.stringify(r.data);
 }
 
-module.exports = async function handler(req, res) {
-  // Basic GET health check
-  if (req.method === "GET") {
-    return res.status(200).json({ status: "ok", note: "POST /api/ask with JSON {query: '...', models:['hf']}" });
+module.exports = async (req, res) => {
+  if (req.method === 'GET') {
+    return res.status(200).json({ status:'ok', note:'POST JSON {query:\"...\", models:[\"hf\",\"openai\"]}' });
   }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed, use POST" });
-  }
+  if (req.method !== 'POST') return res.status(405).json({ error:'Method not allowed, use POST' });
 
   const body = req.body || {};
   const query = body.query || body.prompt || (body.message ? body.message : null);
-  if (!query || typeof query !== "string") {
-    return res.status(400).json({ error: 'Body must be JSON with a "query" string' });
-  }
+  if (!query || typeof query !== 'string') return res.status(400).json({ error:'Body must be JSON with a \"query\" string' });
 
-  const models = Array.isArray(body.models) && body.models.length ? body.models : ["hf"];
+  const models = Array.isArray(body.models) && body.models.length ? body.models : ['hf'];
 
-  // Run requested model calls in parallel; simple normalization.
-  const calls = models.map(m => {
-    if (m === "hf") {
-      return callHfChat(query)
-        .then(r => ({ model: "hf", ok: true, text: r }))
-        .catch(e => ({ model: "hf", ok: false, error: String(e.message || e) }));
+  const tasks = models.map(m => {
+    if (m === 'hf') {
+      return callHfSpace(query)
+        .then(text => ({ model:'hf', ok:true, text }))
+        .catch(err => ({ model:'hf', ok:false, error: err.message || String(err), debug: err.attempts || err.summary }));
     }
-    if (m === "openai") {
+    if (m === 'openai') {
       return callOpenAI(query)
-        .then(r => ({ model: "openai", ok: true, text: r }))
-        .catch(e => ({ model: "openai", ok: false, error: String(e.message || e) }));
+        .then(text => ({ model:'openai', ok:true, text }))
+        .catch(err => ({ model:'openai', ok:false, error: err.message || String(err) }));
     }
-    // unknown model
-    return Promise.resolve({ model: m, ok: false, error: "unknown model" });
+    return Promise.resolve({ model:m, ok:false, error:'unknown model' });
   });
 
-  try {
-    const results = await Promise.all(calls);
-    // Normalize to consistent output
-    const normalized = results.map(r => {
-      if (r.ok) return { model: r.model, text: r.text };
-      return { model: r.model, error: r.error };
-    });
-    return res.json({ query, results: normalized, timestamp: new Date().toISOString() });
-  } catch (err) {
-    return res.status(500).json({ error: String(err.message || err) });
-  }
+  const results = await Promise.all(tasks);
+  return res.json({ query, results, timestamp: new Date().toISOString() });
 };
